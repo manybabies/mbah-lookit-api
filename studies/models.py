@@ -1,4 +1,5 @@
 import logging
+import re
 import uuid
 from datetime import datetime
 
@@ -10,6 +11,7 @@ from botocore.exceptions import ClientError
 from django.conf import settings
 from django.contrib.auth.models import Group, Permission
 from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import SuspiciousFileOperation
 from django.db import models
 from django.db.models.signals import post_save, pre_delete, pre_save
 from django.dispatch import receiver
@@ -1153,6 +1155,21 @@ class Video(models.Model):
         new_full_name = f"{data['payload']}.{data['type'].lower()}"
         throwaway_jpg_name = f"{data['videoName']}.jpg"
 
+        # Check that old_pipe_name is a reasonable filename and that it doesn't fit the pattern used for already-renamed
+        # files. Don't hard-code more detailed expectations of the Pipe ID format here though.
+        if (not re.match("^[A-Za-z0-9-.]+$", old_pipe_name)) or re.match(
+            "^videoStream", old_pipe_name
+        ):
+            raise SuspiciousFileOperation(
+                f"Attempt to rename the following invalid filename on S3: {old_pipe_name}"
+            )
+
+        # Check that new_full_name is a reasonable thing to rename to (e.g., no * or / characters)
+        if not data["payload"] or not re.match("^[A-Za-z0-9-._]+$", new_full_name):
+            raise SuspiciousFileOperation(
+                f"Attempt to create an invalid file on S3: {new_full_name}"
+            )
+
         # No way to directly rename in boto3, so copy and delete original (this is dumb, but let's get it working)
         try:  # Create a copy with the correct new name, if the original exists. Could also
             # wait until old_name_full exists using orig_video.wait_until_exists()
@@ -1168,40 +1185,42 @@ class Video(models.Model):
             # remove the .jpg thumbnail.
             S3_RESOURCE.Object(settings.BUCKET_NAME, throwaway_jpg_name).delete()
 
-        if "PREVIEW_DATA_DISREGARD" in new_full_name:
-            # early exit, since we are not saving an object in the database.
-            return None
-        else:
+        try:
             _, study_uuid, frame_id, response_uuid, timestamp, _ = new_full_name.split(
                 "_"
             )
-
-            # Once we've completed the renaming, we can create our nice db object.
-            try:
-                study = Study.objects.get(uuid=study_uuid)
-            except Study.DoesNotExist as ex:
-                logger.error(f"Study with uuid {study_uuid} does not exist. {ex}")
-                raise
-
-            try:
-                response = Response.objects.get(uuid=response_uuid)
-            except Response.DoesNotExist as ex:
-                logger.error(f"Response with uuid {response_uuid} does not exist. {ex}")
-                raise
-
-            frame_type = response.exp_data.get(frame_id, {}).get("frameType", "")
-
-            return cls.objects.create(
-                pipe_name=old_pipe_name,
-                pipe_numeric_id=data["id"],
-                s3_timestamp=datetime.fromtimestamp(int(timestamp) / 1000, tz=pytz.utc),
-                frame_id=frame_id,
-                size=data["size"],
-                full_name=new_full_name,
-                study=study,
-                response=response,
-                is_consent_footage=(frame_type == "CONSENT"),
+        except ValueError as err:
+            raise SuspiciousFileOperation(
+                f"Attempt to create video file on S3 with unexpected format: {new_full_name}."
             )
+
+        # Once we've completed the renaming, we can create our nice db object.
+        try:
+            study = Study.objects.get(uuid=study_uuid)
+        except Study.DoesNotExist as ex:
+            raise SuspiciousFileOperation(
+                f"Study with uuid {study_uuid} does not exist. {ex}"
+            )
+
+        try:
+            response = Response.objects.get(uuid=response_uuid)
+        except Response.DoesNotExist as ex:
+            logger.error(f"Response with uuid {response_uuid} does not exist. {ex}")
+            raise
+
+        frame_type = response.exp_data.get(frame_id, {}).get("frameType", "")
+
+        return cls.objects.create(
+            pipe_name=old_pipe_name,
+            pipe_numeric_id=data["id"],
+            s3_timestamp=datetime.fromtimestamp(int(timestamp) / 1000, tz=pytz.utc),
+            frame_id=frame_id,
+            size=data["size"],
+            full_name=new_full_name,
+            study=study,
+            response=response,
+            is_consent_footage=(frame_type == "CONSENT"),
+        )
 
     @cached_property
     def filename(self):
